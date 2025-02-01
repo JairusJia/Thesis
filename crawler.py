@@ -1,5 +1,9 @@
 import json
 import time
+import random
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
@@ -8,142 +12,173 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 
+# Thread-safe lock for JSON file writing
+json_lock = threading.Lock()
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+]
+
 def init_browser():
-    """初始化 Selenium 浏览器"""
+    """Initialize Selenium WebDriver with optimized settings."""
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")  # 使用新 headless 模式
+    options.add_argument(f"user-agent={random.choice(USER_AGENTS)}")
+    options.add_argument("--headless=new")  
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--no-sandbox")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+    options.add_argument("--disable-blink-features=AutomationControlled")  
+    options.add_argument("--log-level=3")  
+    options.add_argument("--start-maximized")  
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])  
+    options.add_experimental_option("useAutomationExtension", False)  
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), 
-                                options=options)
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
     return driver
 
-def get_guba_links(url, max_pages=5):
-    """
-    爬取东方财富股吧多页帖子链接
-    :param url: 起始页网址
-    :param max_pages: 最大翻页数
-    :return: 所有爬取的帖子链接
-    """
-    driver = init_browser()
+def get_guba_links(url, max_pages, driver):
+    """Scrape multiple pages of post links."""
     all_links = []
     page_count = 0
 
-    while url and page_count < max_pages:  # 限制最大页数，防止无限翻页
-        driver.get(url)
+    while url and page_count < max_pages:
 
         try:
-            # 确保帖子列表加载完成
-            WebDriverWait(driver, 15).until(
+            driver.get(url)
+            WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CLASS_NAME, "listbody"))
             )
-        except:
-            print(f"网页加载失败: {url}")
+        except Exception as e:
+            print(f"⚠️ Page load timeout, skipping: {e}")
             break
 
-        # 解析 HTML
-        soup = BeautifulSoup(driver.page_source, "html.parser")
+        soup = BeautifulSoup(driver.page_source, "lxml")
 
-        # 1️⃣ 获取帖子链接
-        tbody = soup.find("tbody", class_="listbody")
-        if tbody:
-            for tr in tbody.find_all("tr", class_="listitem"):
-                a_tag = tr.find("a", href=True)
-                if a_tag and a_tag["href"].startswith("/news"):
-                    full_url = "https://guba.eastmoney.com" + a_tag["href"]
-                    all_links.append(full_url)
+        for tr in soup.find_all("tr", class_="listitem"):
+            a_tag = tr.find("a", href=True)
+            if a_tag and a_tag["href"].startswith("/news"):
+                full_url = f"https://guba.eastmoney.com" + a_tag['href']
+                all_links.append(full_url)
 
-        # 2️⃣ 查找下一页按钮
-        next_page = soup.find("a", class_="next")
+        next_page = soup.find("a", class_="nextp")
         if next_page and "href" in next_page.attrs:
-            url = "https://guba.eastmoney.com" + next_page["href"]  # 构造下一页 URL
+            url = next_page["href"]
         else:
-            url = None  # 没有下一页，停止爬取
+            print("✅ No more pages, stopping scrape.")
+            break
 
-        print(f"已爬取第 {page_count + 1} 页，共 {len(all_links)} 个帖子")
         page_count += 1
+        time.sleep(random.uniform(1, 3))  # Avoid being blocked
 
-    driver.quit()
+    print(f"✅ Found {len(all_links)} post links.")
     return all_links
 
 def scrape_post_details(url, driver):
-    """
-    访问帖子页面，提取正文时间、正文内容、评论
-    :param url: 帖子 URL
-    :param driver: Selenium WebDriver 实例
-    :return: 包含正文时间、正文内容、评论的字典
-    """
-    driver.get(url)
-
+    """Extract post details (time, content, comments)."""
     try:
+        driver.get(url)
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.CLASS_NAME, "newstext"))
         )
-    except:
-        print(f"帖子加载失败: {url}")
+
+        soup = BeautifulSoup(driver.page_source, "lxml")
+        post_data = {}
+
+        # Extract post time
+        time_tag = soup.find("div", class_="time")
+        post_time = time_tag.text.strip() if time_tag else "Unknown"
+
+        # Extract post content
+        content_tag = soup.find("div", class_="newstext")
+        post_content = content_tag.text.strip() if content_tag else "No content"
+
+        post_data[post_time] = post_content
+
+        # Extract comments
+        reply_items = soup.find_all("div", class_="l1items1")
+        for reply in reply_items:
+            comment_time_tag = reply.find("span", class_="pubtime")
+            comment_text_tag = reply.find("div", class_="short_text")
+
+            comment_time = comment_time_tag.text.strip() if comment_time_tag else "Unknown"
+            comment_text = comment_text_tag.text.strip() if comment_text_tag else "No comment"
+
+            post_data[comment_time] = comment_text
+
+        return post_data
+
+    except Exception as e:
+        print(f"⚠️ Failed to scrape post: {url}, Error: {e}")
         return None
 
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+def save_to_json(post_data, file_path="guba_posts.json"):
+    """Save scraped data to JSON (Thread-Safe)."""
+    with json_lock:
+        if post_data:
+            try:
+                if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        existing_data = json.load(f)
+                else:
+                    existing_data = {}
 
-    # **创建一个字典，存储正文和评论**
-    post_data = {}
+                existing_data.update(post_data)
 
-    # 1️⃣ 获取正文时间
-    time_tag = soup.find("div", class_="time")
-    post_time = time_tag.text.strip() if time_tag else "未知"
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(existing_data, f, ensure_ascii=False, indent=4)
+            except Exception as e:
+                print(f"⚠️ Failed to write JSON: {e}")
 
-    # 2️⃣ 获取正文内容
-    content_tag = soup.find("div", class_="newstext")
-    post_content = content_tag.text.strip() if content_tag else "无正文"
+thread_local = threading.local()
 
-    # **把正文加入字典**
-    post_data[post_time] = post_content
+def get_driver():
+    """Ensure each thread gets its own WebDriver."""
+    if not hasattr(thread_local, "driver"):
+        thread_local.driver = init_browser()  # ✅ 只创建一次 WebDriver
+    return thread_local.driver
 
-    # 3️⃣ 获取评论（按照 `comment_time: comment_text` 格式存入字典）
-    reply_items = soup.find_all("div", class_="reply_item cl")
-    for reply in reply_items:
-        comment_time_tag = reply.find("span", class_="pubtime")
-        comment_text_tag = reply.find("span", class_="reply_title_span")
-
-        comment_time = comment_time_tag.text.strip() if comment_time_tag else "未知"
-        comment_text = comment_text_tag.text.strip() if comment_text_tag else "无评论"
-
-        # **把评论也存入字典**
-        post_data[comment_time] = comment_text
-
+def scrape_with_thread_driver(url):
+    """Each thread reuses its WebDriver for multiple URLs."""
+    driver = get_driver()  # ✅ 线程内共享 WebDriver
+    post_data = scrape_post_details(url, driver)
     return post_data
 
-def scrape_all_posts(start_url, max_pages=5):
-    """
-    爬取多个帖子及其内容，并保存到 JSON 文件
-    :param start_url: 股吧起始页
-    :param max_pages: 爬取的最大页数
-    """
+def scrape_all_posts(start_url, max_pages, max_threads=5):
+    """Parallel scraping with one WebDriver per thread (not per URL)."""
     driver = init_browser()
-    post_links = get_guba_links(start_url, max_pages)
+    post_links = get_guba_links(start_url, max_pages, driver)
+    driver.quit()  # ✅ 获取链接后关闭 WebDriver
 
-    all_data = []
-    for i, post_url in enumerate(post_links):  # **不限制帖子数量**
-        print(f"正在爬取帖子 {i + 1}/{len(post_links)}: {post_url}")
-        post_data = scrape_post_details(post_url, driver)
-        if post_data:
-            all_data.append(post_data)
-        time.sleep(2)  # 避免请求过快
+    with ThreadPoolExecutor(max_threads) as executor:
+        results = executor.map(scrape_with_thread_driver, post_links)
 
-    driver.quit()
+        for post_data in results:
+            if post_data:
+                save_to_json(post_data)
 
-    # 保存为 JSON 文件
-    with open("guba_posts.json", "w", encoding="utf-8") as f:
-        json.dump(all_data, f, ensure_ascii=False, indent=4)
+    # 🔹 关闭所有线程 WebDriver（确保资源释放）
+    for thread in threading.enumerate():
+        if hasattr(thread_local, "driver"):
+            thread_local.driver.quit()
+            del thread_local.driver  # ✅ 释放线程 WebDriver
 
-    print(f"爬取完成，数据已保存到 guba_posts.json")
 
-# 运行爬虫
 if __name__ == "__main__":
-    start_url = "https://guba.eastmoney.com/list,zssh000001.html"
-    scrape_all_posts(start_url, max_pages=2)
+    start_url = "https://guba.eastmoney.com/list,zssh000001_500.html"
+
+    while True:
+        try:
+            max_pages = int(input("Enter the number of pages to scrape (e.g., 5): "))
+            if max_pages > 0:
+                break
+            else:
+                print("❌ Please enter an integer greater than 0.")
+        except ValueError:
+            print("❌ Please enter a valid number.")
+
+    scrape_all_posts(start_url, max_pages, max_threads=5)
